@@ -1,1 +1,0 @@
-# Voice-Assisted-Object-Detection-System
