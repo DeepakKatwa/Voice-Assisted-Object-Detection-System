@@ -1,0 +1,341 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Real-Time Object Detection Voice Assistant</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+    <style>
+        /* Define a subtle pulse animation for loading states */
+        @keyframes pulse-once {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(249, 115, 22, 0.4); }
+            50% { box-shadow: 0 0 0 8px rgba(249, 115, 22, 0); }
+        }
+        .status-loading {
+            animation: pulse-once 1.5s ease-out infinite;
+        }
+
+        /* Custom styles for the video and canvas container */
+        #videoContainer {
+            position: relative;
+            /* Aspect ratio helper for video/canvas (e.g., 4:3) */
+            padding-bottom: 75%; 
+            height: 0;
+            overflow: hidden;
+            border: 4px solid #f97316; /* Tailwind orange-500 */
+            border-radius: 1rem;
+            box-shadow: 0 10px 20px -5px rgba(0, 0, 0, 0.7); /* Deeper shadow */
+            background-color: #0d1117; /* Dark background for video container */
+        }
+
+        /* The video element is hidden but used as the source for the canvas */
+        #webcam {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            visibility: hidden; /* Hide the raw video, we draw it on canvas */
+        }
+
+        /* The canvas is what the user sees, overlayed with detections */
+        #detectionCanvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+
+        /* Ensuring the body uses Inter font and a dark background */
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #0f172a; /* Tailwind slate-900 */
+        }
+    </style>
+</head>
+<body class="p-4 flex flex-col items-center min-h-screen">
+
+    <div class="max-w-3xl w-full mx-auto p-8 bg-gray-800 rounded-3xl shadow-2xl transition duration-300 transform hover:shadow-orange-500/50">
+        <h1 class="text-4xl font-extrabold text-orange-400 text-center mb-2">
+            Real-Time Voice Assistant
+        </h1>
+        <p class="text-gray-400 text-center mb-6">
+            Object Detection with spoken feedback.
+        </p>
+
+        <div class="flex justify-between space-x-4 mb-6">
+            <div id="statusDiv" class="flex-grow text-center p-4 rounded-xl text-lg font-semibold bg-gray-700 text-yellow-300 status-loading">
+                Initializing...
+            </div>
+            
+            <button id="muteButton" onclick="toggleMute()" class="p-4 bg-gray-600 hover:bg-gray-500 text-white font-bold rounded-xl transition duration-150 shadow-lg flex items-center justify-center space-x-2" title="Toggle Voice Assistant">
+                <span id="muteIcon">&#x1F50A;</span> <span class="hidden sm:inline">Mute</span>
+            </button>
+        </div>
+        
+        <button id="retryButton" onclick="setupWebcam()" class="hidden w-full p-3 mb-6 bg-red-600 hover:bg-red-700 text-white font-bold rounded-xl transition duration-150 shadow-lg">
+            Try Again: Grant Camera Permission
+        </button>
+
+        <div id="videoContainer" class="w-full">
+            <video id="webcam" autoplay playsinline muted></video>
+            <canvas id="detectionCanvas"></canvas>
+        </div>
+
+        <div id="detectionsList" class="mt-8 p-6 bg-gray-700 rounded-xl shadow-inner">
+            <h2 class="text-xl font-bold text-orange-400 mb-3 border-b border-gray-600 pb-2">Detected Objects:</h2>
+            <ul id="listContent" class="space-y-2 text-gray-200">
+                <li class="text-sm italic text-gray-400">Hold an object up to the camera to see the results.</li>
+            </ul>
+        </div>
+    </div>
+
+    <footer class="mt-8 text-sm text-gray-500">
+        <p>Built with TensorFlow.js and COCO-SSD.</p>
+    </footer>
+
+    <script>
+        const video = document.getElementById('webcam');
+        const canvas = document.getElementById('detectionCanvas');
+        const ctx = canvas.getContext('2d');
+        const statusDiv = document.getElementById('statusDiv');
+        const listContent = document.getElementById('listContent');
+        const retryButton = document.getElementById('retryButton');
+        const muteButton = document.getElementById('muteButton');
+        const muteIcon = document.getElementById('muteIcon');
+        
+        let detector = undefined;
+        let animationFrameId = null;
+        let videoWidth, videoHeight;
+
+        // --- VOICE ASSISTANT VARIABLES ---
+        let isMuted = false;
+        let lastSpokenTime = 0;
+        const SPEAK_DEBOUNCE_MS = 5000; // Speak max once every 5 seconds
+        const synthesis = window.speechSynthesis;
+
+        if (typeof tf !== 'undefined') {
+            console.log("TensorFlow.js loaded successfully. Check console for model status.");
+        } else {
+            console.error("TensorFlow.js failed to load. Check network connection.");
+        }
+
+        // --- VOICE ASSISTANT LOGIC ---
+        function toggleMute() {
+            isMuted = !isMuted;
+            if (isMuted) {
+                synthesis.cancel(); // Stop current speech
+                muteIcon.innerHTML = '&#x1F507;'; // Muted icon
+                muteButton.classList.replace('bg-gray-600', 'bg-red-600');
+                muteButton.querySelector('span:last-child').textContent = 'Unmute';
+            } else {
+                muteIcon.innerHTML = '&#x1F50A;'; // Speaker icon
+                muteButton.classList.replace('bg-red-600', 'bg-gray-600');
+                muteButton.querySelector('span:last-child').textContent = 'Mute';
+            }
+        }
+
+        function speak(text) {
+            if (isMuted || !synthesis) return;
+            
+            // Check if the synthesis is busy speaking or waiting to speak
+            if (synthesis.speaking || synthesis.pending) return;
+
+            const utterance = new SpeechSynthesisUtterance(text);
+            utterance.rate = 1.05; // Slightly faster for an assistant feel
+            utterance.pitch = 1.0; 
+            
+            synthesis.speak(utterance);
+        }
+
+        // --- DETECTION CONSTANTS ---
+        const minScore = 0.6; // Confidence threshold
+        const boxColor = '#34d399'; // Tailwind emerald-400
+
+        // Function to initialize webcam stream
+        async function setupWebcam() {
+            // Reset state
+            retryButton.classList.add('hidden');
+            statusDiv.classList.remove('text-red-400', 'text-green-400', 'font-bold');
+            statusDiv.classList.add('text-yellow-300', 'status-loading');
+
+            try {
+                statusDiv.textContent = 'Requesting webcam access...';
+                
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: 'environment' }
+                });
+                
+                video.srcObject = stream;
+                
+                await new Promise((resolve) => {
+                    video.onloadedmetadata = () => { resolve(); };
+                });
+
+                videoWidth = video.videoWidth;
+                videoHeight = video.videoHeight;
+                canvas.width = videoWidth;
+                canvas.height = videoHeight;
+                
+                const container = document.getElementById('videoContainer');
+                
+                // CORRECTED: Use standard string concatenation/template literal for CSS style
+                container.style.paddingBottom = `${(videoHeight / videoWidth) * 100}%`;
+
+                statusDiv.textContent = 'Webcam stream loaded. Loading AI model...';
+
+                video.play();
+                loadModel();
+
+            } catch (error) {
+                console.error("Error setting up webcam:", error);
+                
+                statusDiv.classList.remove('text-yellow-300', 'status-loading');
+                statusDiv.classList.add('text-red-400', 'font-bold');
+                
+                let errorMessage = 'ERROR: Failed to access webcam. Please check your browser settings.';
+
+                if (error.name === 'NotReadableError' || error.message.includes('in use')) {
+                    errorMessage = 'DEVICE IN USE. Your camera is currently being used by another application. Please close it and click "Try Again".';
+                    retryButton.classList.remove('hidden'); 
+                } else if (error.name === 'NotAllowedError' || error.message.includes('Permission dismissed')) {
+                    errorMessage = 'CAMERA ACCESS DENIED. Click "Try Again" below and ensure you allow camera access in the popup.';
+                    retryButton.classList.remove('hidden'); 
+                }
+
+                statusDiv.textContent = errorMessage;
+            }
+        }
+
+        // Function to load the COCO-SSD model
+        async function loadModel() {
+            try {
+                // Load the COCO-SSD model for object detection
+                detector = await cocoSsd.load();
+                
+                statusDiv.classList.remove('text-yellow-300', 'status-loading');
+                statusDiv.classList.add('text-green-400');
+                statusDiv.textContent = 'Object Detection Model loaded! Hold an object to the camera.';
+                
+                // Start the detection loop
+                detectFrame();
+            } catch (error) {
+                console.error("Error loading COCO-SSD model:", error);
+                statusDiv.classList.remove('text-yellow-300', 'status-loading');
+                statusDiv.classList.add('text-red-400', 'font-bold');
+                statusDiv.textContent = 'FATAL ERROR: Failed to load COCO-SSD AI model. Check network.';
+            }
+        }
+
+        // Main loop for continuous object detection
+        function detectFrame() {
+            if (detector && video.readyState === 4) {
+                // Estimate objects from the video frame
+                detector.detect(video).then(predictions => {
+                    renderPredictions(predictions);
+                    // Request next frame for continuous loop
+                    animationFrameId = requestAnimationFrame(detectFrame);
+                }).catch(err => {
+                    console.error("Detection error:", err);
+                    cancelAnimationFrame(animationFrameId);
+                });
+            } else {
+                // Keep trying until video is ready
+                animationFrameId = requestAnimationFrame(detectFrame);
+            }
+        }
+
+        // Function to draw the predictions on the canvas and manage voice output
+        function renderPredictions(predictions) {
+            
+            // Clear canvas and draw current video frame
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+            listContent.innerHTML = '';
+            
+            const filteredPredictions = predictions.filter(p => p.score > minScore);
+
+            if (filteredPredictions.length === 0) {
+                // CORRECTED: Use standard string concatenation/template literal for innerHTML
+                listContent.innerHTML = `<li class="text-sm italic text-gray-400">No objects detected above ${Math.round(minScore * 100)}% confidence.</li>`;
+                return;
+            }
+            
+            let allObjectsList = [];
+
+            // 1. Draw Bounding Boxes and Labels
+            filteredPredictions.forEach(prediction => {
+                const [x, y, width, height] = prediction.bbox;
+                const scorePercent = (prediction.score * 100).toFixed(1);
+                // CORRECTED: Use standard string concatenation/template literal for the label
+                const label = `${prediction.class} (${scorePercent}%)`;
+
+                // Draw box
+                ctx.strokeStyle = boxColor;
+                ctx.lineWidth = 3;
+                ctx.strokeRect(x, y, width, height);
+
+                // Draw label background
+                ctx.fillStyle = boxColor;
+                const textX = x;
+                const textY = y > 10 ? y - 5 : 10;
+                
+                ctx.font = '16px Inter';
+                const textWidth = ctx.measureText(label).width;
+                ctx.fillRect(textX - 2, textY - 14, textWidth + 4, 18);
+                
+                // Draw label text
+                ctx.fillStyle = '#000000';
+                ctx.fillText(label, textX, textY);
+                
+                allObjectsList.push({ class: prediction.class, score: prediction.score });
+
+                // Add to the list
+                const listItem = document.createElement('li');
+                listItem.className = 'text-base font-mono flex justify-between';
+                // CORRECTED: Use standard string concatenation/template literal for innerHTML
+                listItem.innerHTML = `<span>${prediction.class.toUpperCase()}</span> <span class="font-bold text-emerald-300">${scorePercent}%</span>`;
+                listContent.appendChild(listItem);
+            });
+            
+            // 2. Voice Assistant Logic
+            const currentTime = Date.now();
+            if (currentTime - lastSpokenTime > SPEAK_DEBOUNCE_MS && filteredPredictions.length > 0) {
+                // Find the highest confidence prediction among the filtered ones
+                const primaryDetection = filteredPredictions.reduce((prev, current) => 
+                    (prev.score > current.score) ? prev : current
+                );
+
+                const objectName = primaryDetection.class;
+                
+                // Capitalize and replace underscores for better reading
+                const readableName = objectName.charAt(0).toUpperCase() + objectName.slice(1).replace(/_/g, ' ');
+
+                speak(`I see a ${readableName}.`);
+                lastSpokenTime = currentTime; 
+            }
+        }
+
+        // Start the application setup when the window loads
+        window.onload = setupWebcam;
+
+        // Cleanup function
+        window.onbeforeunload = () => {
+            if (animationFrameId) {
+                cancelAnimationFrame(animationFrameId);
+            }
+            if (video.srcObject) {
+                video.srcObject.getTracks().forEach(track => track.stop());
+            }
+            if (synthesis) {
+                synthesis.cancel(); // Stop any pending speech
+            }
+        };
+
+    </script>
+</body>
+</html>
